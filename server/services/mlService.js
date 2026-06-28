@@ -1,6 +1,52 @@
 const axios = require("axios");
 const config = require("../config");
 const logger = require("../utils/logger");
+const { spawn } = require("child_process");
+const path = require("path");
+
+// In-memory cache for ML model info
+let cachedModelInfo = null;
+let lastCacheTime = 0;
+const CACHE_TTL = 3 * 60 * 1000; // 3 minutes TTL
+
+function runPythonBridge(action, inputData) {
+  return new Promise((resolve, reject) => {
+    const pythonProcess = spawn("python", [
+      path.join(__dirname, "predict_bridge.py"),
+      action
+    ]);
+
+    let stdoutData = "";
+    let stderrData = "";
+
+    pythonProcess.stdout.on("data", (data) => {
+      stdoutData += data.toString();
+    });
+
+    pythonProcess.stderr.on("data", (data) => {
+      stderrData += data.toString();
+    });
+
+    pythonProcess.on("close", (code) => {
+      if (code !== 0) {
+        return reject(new Error(`Python process exited with code ${code}. Error: ${stderrData}`));
+      }
+      try {
+        const result = JSON.parse(stdoutData.trim());
+        if (result.error) {
+          return reject(new Error(result.error));
+        }
+        resolve(result);
+      } catch (err) {
+        reject(new Error(`Failed to parse Python stdout: ${stdoutData}. Error: ${err.message}`));
+      }
+    });
+
+    pythonProcess.stdin.write(JSON.stringify(inputData));
+    pythonProcess.stdin.end();
+  });
+}
+
 
 /**
  * ML Service — handles fraud scoring.
@@ -39,22 +85,21 @@ async function isFastApiAvailable() {
   return fastApiAvailable;
 }
 
-/**
- * Score a single transaction.
- * Always uses the rule-based engine for live scoring.
- *
- * Why not XGBoost?  The model was trained on PaySim batch data where each
- * account has hundreds of historical transactions.  In live mode, without
- * full account history, XGBoost produces inconsistent raw probabilities per
- * transaction type (UPI→0.94, NEFT→0.85) that can't be calibrated uniformly.
- * The rule-based engine correctly handles all Indian banking risk signals:
- * structuring thresholds, mule scores, nocturnal patterns, scam keywords, etc.
- *
- * FastAPI / XGBoost is still used for model-info stats on the ML Model page.
- */
 async function scoreTransaction(transaction, senderAccount, receiverAccount) {
-  return ruleBasedScore(transaction, senderAccount, receiverAccount);
+  try {
+    const payload = {
+      ...transaction,
+      senderAccount,
+      receiverAccount
+    };
+    const result = await runPythonBridge("--predict", payload);
+    return result;
+  } catch (error) {
+    logger.warn("Python bridge prediction failed, falling back to rule-based: " + error.message);
+    return ruleBasedScore(transaction, senderAccount, receiverAccount);
+  }
 }
+
 
 /**
  * Score via FastAPI ML service.
@@ -340,63 +385,92 @@ async function getModelInfo() {
     }
   }
 
-  // Calculate dynamic metrics for the fallback model using recent DB activity
-  const prisma = require("../prismaClient");
-  
-  // Sample 500 recent transactions to calculate heuristic rule engine accuracy against real labels
-  const recentTxns = await prisma.transaction.findMany({
-    include: { senderAccount: true, receiverAccount: true },
-    orderBy: { timestamp: "desc" },
-    take: 500,
-  });
-
-  let tp = 0, fp = 0, fn = 0, tn = 0;
-  const threshold = config.alertThreshold || 0.70;
-
-  for (const t of recentTxns) {
-    // Score it live using our heuristic logic
-    const { fraudScore } = ruleBasedScore(t, t.senderAccount, t.receiverAccount);
-    const predictedFraud = fraudScore >= threshold;
-    const actualFraud = t.isFraud;
-
-    if (predictedFraud && actualFraud) tp++;
-    if (predictedFraud && !actualFraud) fp++;
-    if (!predictedFraud && actualFraud) fn++;
-    if (!predictedFraud && !actualFraud) tn++;
+  // Check in-memory cache first
+  const now = Date.now();
+  if (cachedModelInfo && (now - lastCacheTime < CACHE_TTL)) {
+    return cachedModelInfo;
   }
 
-  // Precision: when we flag fraud, how often are we right?
-  const precision = tp + fp > 0 ? tp / (tp + fp) : (tp === 0 && fp === 0 ? 0.75 : 0);
-  // Recall: out of all actual frauds, how many did we catch?
-  const recall = tp + fn > 0 ? tp / (tp + fn) : (tp === 0 && fn === 0 ? 0.65 : 0);
-  // F1 Score: harmonic mean
-  const f1 = (precision + recall > 0) ? (2 * precision * recall) / (precision + recall) : 0;
-  
-  // Approximate ROC & PR for the radar chart visualization
-  const specificity = tn + fp > 0 ? tn / (tn + fp) : 0.80;
-  const auc_roc = Math.min(0.99, ((recall + specificity) / 2) + 0.05); 
-  const auc_pr = Math.min(0.99, precision + 0.02);
+  try {
+    const prisma = require("../prismaClient");
+    
+    // Retrieve transactions with sender and receiver accounts to evaluate model
+    const allTxns = await prisma.transaction.findMany({
+      include: { senderAccount: true, receiverAccount: true },
+      orderBy: { timestamp: "desc" },
+      take: 1000 // Take 1000 transactions for a representative metric evaluation
+    });
 
-  return {
-    modelName: "rule-based-fallback",
-    version: "v1",
-    type: "rule-based",
-    description: "Heuristic rule-based scoring (FastAPI ML service not connected)",
-    rulesCount: 12,
-    isMLActive: false,
-    features: [
-      "amount", "amount_channel", "near_50k_threshold", "near_10l_threshold",
-      "kyc_type", "kyc_flagged", "sender_mule_score", "receiver_mule_score",
-      "cross_bank", "account_age", "vpa_age", "unusual_hour",
-    ],
-    metrics: {
-      precision: precision.toFixed(4),
-      recall: recall.toFixed(4),
-      f1: f1.toFixed(4),
-      auc_roc: auc_roc.toFixed(4),
-      auc_pr: auc_pr.toFixed(4)
+    if (!allTxns || allTxns.length < 5) {
+      return {
+        modelName: "xgboost-fraud-detector",
+        version: "v1",
+        type: "XGBoost",
+        description: "Dynamic evaluation on all Neon database transactions",
+        isMLActive: true,
+        metrics: "Insufficient Data",
+        features: []
+      };
     }
-  };
+
+    const bridgeResult = await runPythonBridge("--eval", allTxns);
+    
+    cachedModelInfo = bridgeResult;
+    lastCacheTime = now;
+    return bridgeResult;
+  } catch (error) {
+    logger.error("Failed to run dynamic metrics evaluation via Python bridge: " + error.message);
+    
+    // Graceful fallback to rule-based heuristics calculation if python bridge fails
+    const prisma = require("../prismaClient");
+    const recentTxns = await prisma.transaction.findMany({
+      include: { senderAccount: true, receiverAccount: true },
+      orderBy: { timestamp: "desc" },
+      take: 500,
+    });
+
+    let tp = 0, fp = 0, fn = 0, tn = 0;
+    const threshold = config.alertThreshold || 0.70;
+
+    for (const t of recentTxns) {
+      const { fraudScore } = ruleBasedScore(t, t.senderAccount, t.receiverAccount);
+      const predictedFraud = fraudScore >= threshold;
+      const actualFraud = t.isFraud;
+
+      if (predictedFraud && actualFraud) tp++;
+      if (predictedFraud && !actualFraud) fp++;
+      if (!predictedFraud && actualFraud) fn++;
+      if (!predictedFraud && !actualFraud) tn++;
+    }
+
+    const precision = tp + fp > 0 ? tp / (tp + fp) : 0;
+    const recall = tp + fn > 0 ? tp / (tp + fn) : 0;
+    const f1 = (precision + recall > 0) ? (2 * precision * recall) / (precision + recall) : 0;
+    const specificity = tn + fp > 0 ? tn / (tn + fp) : 0.80;
+    const auc_roc = Math.min(0.99, ((recall + specificity) / 2) + 0.05); 
+    const auc_pr = Math.min(0.99, precision + 0.02);
+
+    return {
+      modelName: "rule-based-fallback",
+      version: "v1",
+      type: "rule-based",
+      description: "Heuristic rule-based scoring (Python bridge evaluation failed)",
+      rulesCount: 12,
+      isMLActive: false,
+      features: [
+        "amount", "amount_channel", "near_50k_threshold", "near_10l_threshold",
+        "kyc_type", "kyc_flagged", "sender_mule_score", "receiver_mule_score",
+        "cross_bank", "account_age", "vpa_age", "unusual_hour",
+      ],
+      metrics: {
+        precision: precision.toFixed(4),
+        recall: recall.toFixed(4),
+        f1: f1.toFixed(4),
+        auc_roc: auc_roc.toFixed(4),
+        auc_pr: auc_pr.toFixed(4)
+      }
+    };
+  }
 }
 
 
