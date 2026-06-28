@@ -186,7 +186,11 @@
       same "printed page" as the copyright notice for easier
       identification within third-party archives.
 
+<<<<<<< HEAD
    Copyright 2026 Ayush Pathak
+=======
+   Copyright [yyyy] [name of copyright owner]
+>>>>>>> 1723273383464a6c399c742c4e8d5b7c139c5f42
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
