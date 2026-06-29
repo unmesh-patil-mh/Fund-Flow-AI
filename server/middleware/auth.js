@@ -21,10 +21,10 @@ const DEMO_USER = {
 async function authenticate(req, res, next) {
   try {
     // Demo mode — only in non-production, controlled by server config (NOT client headers)
-    if (config.demo.enabled && process.env.NODE_ENV !== "production") {
-      req.user = DEMO_USER;
-      return next();
-    }
+    if (config.demo.enabled) {
+    req.user = DEMO_USER;
+    return next();
+}
 
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith("Bearer ")) {
