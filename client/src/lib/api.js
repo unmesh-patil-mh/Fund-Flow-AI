@@ -1,7 +1,11 @@
 import axios from "axios";
 
+const API_URL = import.meta.env.DEV
+  ? "/api"
+  : "https://fund-flow-ai-do04.onrender.com/api";
+
 const api = axios.create({
-  baseURL: "/api",
+  baseURL: API_URL,
   headers: {
     "Content-Type": "application/json",
     "X-Demo-Mode": "true",

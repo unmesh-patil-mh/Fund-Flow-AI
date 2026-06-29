@@ -1,6 +1,11 @@
 import { io } from "socket.io-client";
 
-const socket = io("/", {
+const SOCKET_URL =
+  import.meta.env.DEV
+    ? "/"
+    : "https://fund-flow-ai-do04.onrender.com";
+
+const socket = io(SOCKET_URL, {
   transports: ["websocket", "polling"],
   autoConnect: true,
 });
